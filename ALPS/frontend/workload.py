@@ -6,7 +6,7 @@ def get_cpu_time(cid):
     return 100 
 
 # Updated readWorkload to accept real_stats from Ghost
-def readWorkload(init, init_v, real_stats=None, lens=100):
+def readWorkload(init, init_v, real_stats=None, real_runtimes=None, lens=100):
     wl = []
     
     # Generate 'lens' number of dummy jobs
@@ -14,6 +14,14 @@ def readWorkload(init, init_v, real_stats=None, lens=100):
         invocationId = init_v + i + 1
         startTime = i * 10  # Stagger arrival times
         class_id = (i % 4) + 1  # Rotate through class IDs 1-4
+
+        # Default dummy duration
+        duration = 100 
+        
+        # [ALPS] Use Real Runtime if available
+        if real_runtimes and real_runtimes.get(class_id, 0) > 0:
+            # Convert ns to ms
+            duration = real_runtimes[class_id] / 1000000.0
         
         # Create a job with dummy parameters
         # Job signature: (id, start_time, execution_time, priority, arrival_index, class_id)

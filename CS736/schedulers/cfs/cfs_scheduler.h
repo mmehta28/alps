@@ -73,8 +73,8 @@ inline int readValue(int fileName) {
 
     int fileDescriptor = open(filename.c_str(), O_RDONLY);
     if (fileDescriptor == -1) {
-        fprintf(stderr, "DEBUG: Failed to open file: %s (errno: %d)\n", filename.c_str(), errno);
-        std::cerr << "Error opening file." << std::endl;
+        // fprintf(stderr, "DEBUG: Failed to open file: %s (errno: %d)\n", filename.c_str(), errno);
+        // std::cerr << "Error opening file." << std::endl;
         return 0;
     }
 
@@ -649,6 +649,7 @@ class CfsScheduler : public BasicDispatchScheduler<CfsTask> {
   // Stats for Closed Loop (if you implemented the feedback logic)
   struct AlpsStats {
       uint64_t total_wait_ns;
+      uint64_t total_runtime_ns;
       uint64_t count;
   };
   std::array<AlpsStats, 101> alps_stats_;

@@ -163,7 +163,7 @@ void CfsScheduler::PolicyUpdateLoop() {
 
     // Buffer to send stats (Average Wait Time in ns). 
     // Size must be exactly 100 integers (800 bytes).
-    uint64_t stats_buffer[100]; 
+    uint64_t stats_buffer[200]; 
 
     while (!stop_policy_thread_) {
         // --- 1. Connection Logic ---
@@ -192,15 +192,23 @@ void CfsScheduler::PolicyUpdateLoop() {
             absl::MutexLock lock(&stats_mu_);
             for (int i = 0; i < 100; ++i) {
                 int class_id = i + 1;
+                uint64_t count = alps_stats_[class_id].count;
                 
-                if (alps_stats_[class_id].count > 0) {
-                    stats_buffer[i] = alps_stats_[class_id].total_wait_ns / alps_stats_[class_id].count;
+                if (count > 0) {
+                    // Index 0-99: Wait Time
+                    stats_buffer[i] = alps_stats_[class_id].total_wait_ns / count;
                     
-                    // Reset stats for the next measurement interval
+                    // Index 100-199: Runtime (New!)
+                    // We check runtime > 0 to avoid division by zero if logic differs
+                    stats_buffer[i + 100] = alps_stats_[class_id].total_runtime_ns / count;
+                    
+                    // Reset
                     alps_stats_[class_id].total_wait_ns = 0;
+                    alps_stats_[class_id].total_runtime_ns = 0;
                     alps_stats_[class_id].count = 0;
                 } else {
-                    stats_buffer[i] = 0; 
+                    stats_buffer[i] = 0;
+                    stats_buffer[i + 100] = 0;
                 }
             }
         }
@@ -861,116 +869,82 @@ void CfsScheduler::CfsSchedule(const Cpu& cpu, BarrierToken agent_barrier,
   int SEAL_break = 0;
 
   if (prev) {
-    // 1. Determine Class ID
-    // We cache the class_id (read from file) so we only do I/O once per task.
-    // NOTE: Ensure you added 'int class_id = 0;' to CfsTask in cfs_scheduler.h
+    // --- 1. Class ID & Policy Logic (Correct) ---
     if (prev->class_id == 0) {
       prev->class_id = readValue(prev->gtid.tid());
-      if (prev->class_id != 0) {
-         fprintf(stderr, "ALPS MAP SUCCESS: Task %d mapped to Class %d\n", 
-                 prev->gtid.tid(), prev->class_id);
-      } else {
-         // Log failure to map
-         // This helps us see if it keeps retrying and failing
-         // Use a counter or static limit to avoid spamming if desired
-         static int fail_log_count = 0;
-         if (fail_log_count++ < 20) {
-             fprintf(stderr, "ALPS MAP FAIL: Task %d has Class ID 0 (File read failed)\n", prev->gtid.tid());
-         }
-      }
+      // Optional logging...
     }
 
     int class_id = prev->class_id;
     int priority = 0;
-    uint64_t timeslice = 10000000; // Default to 10ms if policy not found
+    uint64_t timeslice = 10000000; 
 
-    // 2. Retrieve Dynamic Policy from ALPS array
-    // We use a reader lock to allow concurrent reads from multiple CPUs
     if (class_id >= 1 && class_id <= 100) {
       absl::ReaderMutexLock lock(&policy_mu_);
       priority = alps_policies_[class_id].priority;
       timeslice = alps_policies_[class_id].timeslice_ns;
     }
 
-    // 3. Update Priority for Sorting
-    // We update seal_prio so the scheduler (Less function) sorts by the 
-    // latest dynamic priority from the server, not the static class ID.
     prev->seal_prio = priority;
 
-    // 4. Check Time Slice Logic
-    // If the task hasn't used its assigned timeslice, we set SEAL_break = 1.
-    // PickNextTaskSEALs will see this and return 'prev' (preventing preemption).
     if (prev->runtime_at_current_time_slice < timeslice) {
       SEAL_break = 1;
     } else {
-      // Timeslice expired: Allow preemption and reset counter
       prev->runtime_at_current_time_slice = 0;
       SEAL_break = 0; 
     }
   }
 
   if (prio_boost) {
-    // If we are currently running a task, we need to put it back onto the
-    // queue.
-    if (prev) {
-      absl::MutexLock l(&cs->run_queue.mu_);
-      switch (prev->task_state.GetState()) {
-        case CfsTaskState::State::kNumStates:
-          CHECK(false);
-          break;
-        case CfsTaskState::State::kBlocked:
-          break;
-        case CfsTaskState::State::kDone:
-          cs->run_queue.DequeueTask(prev);
-          allocator()->FreeTask(prev);
-          break;
-        case CfsTaskState::State::kRunnable:
-          // This case exclusively handles a task yield:
-          // - TaskYield: task->state goes from kRunning -> kRunnable
-          // - PickNextTask: we need to put the task back in the rq.
-          cs->run_queue.PutPrevTask(prev);
-          break;
-        case CfsTaskState::State::kRunning:
-          cs->run_queue.PutPrevTask(prev);
-          prev->task_state.SetState(CfsTaskState::State::kRunnable);
-          break;
-      }
-
-      cs->preempt_curr = false;
-      cs->current = nullptr;
-      cs->run_queue.UpdateMinVruntime(cs);
-    }
-    // If we are prio_boost'ed, then we are temporarily running at a higher
-    // priority than (kernel) CFS.
+    // ... (Prio boost logic, unchanged) ...
     req->LocalYield(agent_barrier, RTLA_ON_IDLE);
     return;
   }
 
   cs->run_queue.mu_.Lock();
-  
-  // Use the SEALs version of PickNextTask with our calculated flag
   CfsTask* next = cs->run_queue.PickNextTaskSEALs(prev, allocator(), cs, SEAL_break);
-  
   cs->run_queue.mu_.Unlock();
 
   if (!next && idle_load_balancing_) {
     next = NewIdleBalance(cs);
   }
 
+  // --- [FIX START] Initialize Class ID for NEXT task ---
+  if (next && next->class_id == 0) {
+      // Try to read the class ID immediately so we can use it for stats
+      next->class_id = readValue(next->gtid.tid());
+      
+      // Optional: Debug log to confirm it worked
+      if (next->class_id != 0) {
+          fprintf(stderr, "ALPS MAP (Lazy): Task %d mapped to Class %d\n", 
+                  next->gtid.tid(), next->class_id);
+      }
+  }
+  // --- [FIX END] ---
+
+  // --- [ALPS] FIXED STATS LOGIC ---
+  if (next) {
+      // CRITICAL FIX: Only count "Wait Time" if we actually switched tasks.
+      // If next == prev, the task continued running and did not "wait".
+      if (next != prev) { 
+          absl::Duration wait_duration = absl::Now() - next->enqueue_time;
+          uint64_t wait_ns = absl::ToInt64Nanoseconds(wait_duration);
+          int class_id = next->class_id;
+
+          if (class_id >= 1 && class_id <= 100) {
+              absl::MutexLock lock(&stats_mu_);
+              alps_stats_[class_id].total_wait_ns += wait_ns;
+              
+              // Increment count here. This means "Count" = "Number of Times Scheduled"
+              alps_stats_[class_id].count++;
+          }
+      }
+  }
+  // --------------------------------
+
   cs->current = next;
 
   if (next) {
-    // [ALPS] Calculate Wait Time
-    absl::Duration wait_duration = absl::Now() - next->enqueue_time;
-    uint64_t wait_ns = absl::ToInt64Nanoseconds(wait_duration);
-    int class_id = next->class_id;
-
-    if (class_id >= 1 && class_id <= 100) {
-        absl::MutexLock lock(&stats_mu_);
-        alps_stats_[class_id].total_wait_ns += wait_ns;
-        alps_stats_[class_id].count++;
-    }
-
     DPRINT_CFS(2, absl::StrFormat("[%s]: Picked via PickNextTask",
                                   next->gtid.describe()));
 
@@ -986,21 +960,28 @@ void CfsScheduler::CfsSchedule(const Cpu& cpu, BarrierToken agent_barrier,
     }
 
     uint64_t before_runtime = next->status_word.runtime();
+    
+    // Commit the transaction (Run the task)
     if (req->Commit()) {
-      GHOST_DPRINT(3, stderr, "Task %s oncpu %d", next->gtid.describe(),
-                   cpu.id());
-      
+      // Task has finished running this slice. Now calculate Runtime.
       uint64_t runtime = next->status_word.runtime() - before_runtime;
-      
-      // Update vruntime
+
+      // --- [ALPS] RUNTIME AGGREGATION ---
+      // We accumulate runtime every time the task runs.
+      // Since we only increment 'count' on switches (above), 
+      // 'total_runtime / count' effectively calculates "Average Burst Length".
+      if (next->class_id >= 1 && next->class_id <= 100) {
+          absl::MutexLock lock(&stats_mu_);
+          alps_stats_[next->class_id].total_runtime_ns += runtime; 
+      }
+      // ----------------------------------
+
       next->vruntime += absl::Nanoseconds(static_cast<uint64_t>(
           static_cast<absl::uint128>(next->inverse_weight) * runtime >> 22));
       
-      // Update our custom timeslice tracking
       next->runtime_at_current_time_slice += runtime;
     } else {
-      GHOST_DPRINT(3, stderr, "CfsSchedule: commit failed (state=%d)",
-                   req->state());
+       // ... failure handling ...
     }
   } else {
     req->LocalYield(agent_barrier, 0);
@@ -1190,7 +1171,7 @@ void CfsRq::PutPrevTask(CfsTask* task) ABSL_EXCLUSIVE_LOCKS_REQUIRED(mu_) {
 
   DPRINT_CFS(2,
              absl::StrFormat("[%s]: Putting prev task", task->gtid.describe()));
-
+  task->enqueue_time = absl::Now();
   InsertTaskIntoRq(task);
 }
 

@@ -49,11 +49,12 @@ def handle_client(client_socket, args):
     
     # [Closed Loop] Track the last policy we sent to use as 'old_policy' 
     # for smoothing in algorithm.py, since the client no longer echoes it back.
-    last_sent_policy = {} 
+    last_sent_policy = {}
+    STATS_FORMAT = '<200Q'
 
     while True:
         # 1. Receive Data (Blocking)
-        data = client_socket.recv(struct.calcsize(STRUCT_FORMAT))
+        data = client_socket.recv(struct.calcsize(STATS_FORMAT))
         if not data:
             break
         
@@ -62,15 +63,14 @@ def handle_client(client_socket, args):
         per_cpu_utilization = psutil.cpu_percent(interval=1, percpu=True)[:24]
         cpu_ulilization = sum(per_cpu_utilization) / len(per_cpu_utilization)
         
-        # 3. Unpack Stats (New Logic)
-        # The buffer contains 100 integers representing avg_wait_ns for each class
-        # We convert this tuple into a dictionary {class_id: wait_time_ns}
-        ghost_stats_raw = struct.unpack(STRUCT_FORMAT, data)
-        ghost_stats = {i+1: ghost_stats_raw[i] for i in range(100)}
+        all_stats = struct.unpack(STATS_FORMAT, data)
         
-        # 4. Create Workload with Feedback
-        # Pass the real stats (ghost_stats) so the simulation reflects reality
-        wl, init_v = workload.readWorkload(init, init_v, ghost_stats)
+        # 2. Split into Wait and Runtime
+        ghost_waits = {i+1: all_stats[i] for i in range(100)}
+        ghost_runtimes = {i+1: all_stats[i+100] for i in range(100)} # Offset 100
+
+        # 3. Pass BOTH to workload
+        wl, init_v = workload.readWorkload(init, init_v, ghost_waits, ghost_runtimes)
         init = False
         
         # 5. Run Simulation
